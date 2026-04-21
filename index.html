@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>EEW P波 S波（MapLibre版）</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet"/>
+<script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+
+<style>
+body{margin:0;background:#000;}
+#map{width:100%;height:100vh;}
+.info{
+ position:absolute;
+ top:10px;left:10px;
+ background:#000a;
+ color:#fff;
+ padding:10px;
+ border-radius:8px;
+}
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+<div class="info" id="info">読み込み中...</div>
+
+<script>
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://demotiles.maplibre.org/style.json',
+  center: [139.76,35.68],
+  zoom: 5
+});
+
+let tables = {};
+let depths = [];
+
+// ==========================
+// 走時表読み込み
+// ==========================
+async function loadTables(){
+  let files = [];
+
+  for(let i=0;i<=3900;i+=100){
+    let d = String(i).padStart(5,"0");
+    files.push({file:`data/tjma2001h.+${d}`, depth:i/100});
+  }
+
+  for(let i=100;i<=4000;i+=100){
+    let d = String(i).padStart(5,"0");
+    files.push({file:`data/tjma2001h.-${d}`, depth:i/100});
+  }
+
+  for(let f of files){
+    try{
+      const res = await fetch(f.file);
+      const text = await res.text();
+
+      tables[f.depth] = [];
+      depths.push(f.depth);
+
+      const lines = text.split("\n");
+
+      for(let line of lines){
+        line = line.trim();
+        if(!line) continue;
+
+        const cols = line.split(/\s+/);
+
+        const dist = parseFloat(cols[0]);
+        const p = parseFloat(cols[1]);
+        const s = parseFloat(cols[2]);
+
+        if(!isNaN(dist)){
+          tables[f.depth].push({dist,p,s});
+        }
+      }
+
+    }catch(e){}
+  }
+
+  depths.sort((a,b)=>a-b);
+  document.getElementById("info").innerText="走時表読み込み完了";
+}
+
+// ==========================
+// 補間
+// ==========================
+function lerp(a,b,t){
+  return a+(b-a)*t;
+}
+
+function getDistance(elapsed, depth, type){
+  let d1 = depths[0], d2 = depths[depths.length-1];
+
+  for(let i=0;i<depths.length-1;i++){
+    if(depth >= depths[i] && depth <= depths[i+1]){
+      d1 = depths[i];
+      d2 = depths[i+1];
+      break;
+    }
+  }
+
+  const dist1 = getDistanceAtDepth(elapsed, d1, type);
+  const dist2 = getDistanceAtDepth(elapsed, d2, type);
+
+  const t = (depth - d1)/(d2 - d1);
+  return lerp(dist1, dist2, t);
+}
+
+function getDistanceAtDepth(elapsed, depth, type){
+  const arr = tables[depth];
+  if(!arr) return 0;
+
+  for(let i=0;i<arr.length-1;i++){
+    const t1 = arr[i][type];
+    const t2 = arr[i+1][type];
+
+    if(elapsed >= t1 && elapsed <= t2){
+      const ratio = (elapsed - t1)/(t2 - t1);
+      return lerp(arr[i].dist, arr[i+1].dist, ratio);
+    }
+  }
+
+  return arr[arr.length-1].dist;
+}
+
+// ==========================
+// 円描画
+// ==========================
+function createCircle(center, radiusKm, points=64){
+  const coords = [];
+  const R = 6371;
+
+  for(let i=0;i<=points;i++){
+    const angle = (i/points)*2*Math.PI;
+
+    const dx = radiusKm * Math.cos(angle);
+    const dy = radiusKm * Math.sin(angle);
+
+    const lat = center[1] + (dy / R) * (180/Math.PI);
+    const lon = center[0] + (dx / R) * (180/Math.PI) / Math.cos(center[1]*Math.PI/180);
+
+    coords.push([lon,lat]);
+  }
+
+  return {
+    type:"Feature",
+    geometry:{
+      type:"Polygon",
+      coordinates:[coords]
+    }
+  };
+}
+
+// ==========================
+// EEW
+// ==========================
+let originTime=null;
+let center=[139.76,35.68];
+let depth=10;
+
+const ws = new WebSocket("wss://ws-api.wolfx.jp/jma_eew");
+
+ws.onmessage = e=>{
+  const data = JSON.parse(e.data);
+
+  if(data.latitude){
+    center = [data.longitude,data.latitude];
+    depth = data.depth || 10;
+    originTime = new Date(data.origin_time);
+
+    map.flyTo({center:center,zoom:6});
+
+    document.getElementById("info").innerText =
+      `震源: ${data.latitude},${data.longitude} 深さ:${depth}km`;
+  }
+};
+
+// ==========================
+// 描画更新
+// ==========================
+setInterval(()=>{
+  if(!originTime || !map.isStyleLoaded()) return;
+
+  const elapsed = (Date.now() - originTime)/1000;
+
+  const pKm = getDistance(elapsed, depth, "p");
+  const sKm = getDistance(elapsed, depth, "s");
+
+  const pGeo = createCircle(center, pKm);
+  const sGeo = createCircle(center, sKm);
+
+  if(map.getSource("pwave")){
+    map.getSource("pwave").setData(pGeo);
+    map.getSource("swave").setData(sGeo);
+    return;
+  }
+
+  map.addSource("pwave",{type:"geojson",data:pGeo});
+  map.addSource("swave",{type:"geojson",data:sGeo});
+
+  map.addLayer({
+    id:"pwave",
+    type:"line",
+    source:"pwave",
+    paint:{
+      "line-color":"#00f",
+      "line-width":2
+    }
+  });
+
+  map.addLayer({
+    id:"swave",
+    type:"line",
+    source:"swave",
+    paint:{
+      "line-color":"#f00",
+      "line-width":2
+    }
+  });
+
+},1000);
+
+// 起動
+loadTables();
+</script>
+
+</body>
+</html>
